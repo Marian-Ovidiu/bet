@@ -15,6 +15,8 @@ export interface ExchangeSnapshot {
   backOdds: number;
   layOdds: number;
   liquidity: number;
+  estimatedLiquidity?: number;
+  maxStakeEstimate?: number;
   timestamp: IsoTimestamp;
 }
 
