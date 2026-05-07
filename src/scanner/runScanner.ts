@@ -3,7 +3,7 @@ import { loadConfig } from "@/config/loadConfig";
 import { MockExchangeFeed } from "@/feeds/mockExchangeFeed";
 import { groupByMarket } from "@/matching";
 import { PaperExecutionEngine } from "@/paper/PaperExecutionEngine";
-import { writeSessionSummary } from "@/reports/writeSessionSummary";
+import { appendPaperTradeLog, createScannerOutput, writeSessionSummary } from "@/reports/writeSessionSummary";
 import type { ArbitrageOpportunity } from "@/types/arbitrage";
 
 interface RuntimeSummary {
@@ -35,6 +35,7 @@ function runScanner(): void {
     acceptedCount: 0,
     bestOpportunity: null,
   };
+  const outputPaths = createScannerOutput(runtime.sessionId);
   const paperEngine = new PaperExecutionEngine({
     enabled: config.enablePaperTrading,
     startingBalance: config.paperStartingBalance,
@@ -94,6 +95,7 @@ function runScanner(): void {
     const acceptedOpportunities = result.opportunities.filter((opportunity) => opportunity.status === "accepted");
     for (const opportunity of acceptedOpportunities) {
       const trade = paperEngine.executeOpportunity(opportunity, nowIso);
+      appendPaperTradeLog(outputPaths.tradeLogFile, trade);
       if (trade.status === "opened" || trade.status === "partial_fill") {
         const paperStats = paperEngine.getStats();
         console.log(
@@ -153,6 +155,8 @@ function runScanner(): void {
       sessionId: runtime.sessionId,
       startedAt: runtime.startedAt,
       endedAt,
+      outputDir: outputPaths.outputDir,
+      tradeLogFile: outputPaths.tradeLogFile,
       durationMs: Date.parse(endedAt) - Date.parse(runtime.startedAt),
       ticks: runtime.ticks,
       marketsScanned: runtime.marketsScanned,
@@ -167,8 +171,15 @@ function runScanner(): void {
       unmatchedRiskEvents: paperStats.unmatchedRiskEvents,
       startingBalance: paperStats.startingBalance,
       endingBalance: paperStats.endingBalance,
+      totalGrossProfit: paperStats.totalGrossProfit,
+      totalCommissionPaid: paperStats.totalCommissionPaid,
       realizedPaperPnl: paperStats.realizedPaperPnl,
       maxOpenExposure: paperStats.maxOpenExposure,
+      avgProfitPerTrade: paperStats.avgProfitPerTrade,
+      bestTrade: paperStats.bestTrade,
+      worstTrade: paperStats.worstTrade,
+      partialFillRate: paperStats.partialFillRate,
+      unmatchedRiskRate: paperStats.unmatchedRiskRate,
       bestOpportunity: runtime.bestOpportunity
         ? {
             id: runtime.bestOpportunity.id,
@@ -182,7 +193,7 @@ function runScanner(): void {
           }
         : null,
       configSnapshot: config,
-    });
+    }, runtime.bestOpportunity);
     console.log(`[scanner] session summary written to ${outputPath}`);
     process.exit(0);
   };

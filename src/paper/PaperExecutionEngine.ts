@@ -13,6 +13,8 @@ export interface PaperExecutionConfig {
 export class PaperExecutionEngine {
   private readonly config: PaperExecutionConfig;
   private readonly trades: PaperTrade[];
+  private totalGrossProfit: number;
+  private totalCommissionPaid: number;
   private realizedPnl: number;
   private currentOpenExposure: number;
   private maxOpenExposureSeen: number;
@@ -24,6 +26,8 @@ export class PaperExecutionEngine {
   public constructor(config: PaperExecutionConfig) {
     this.config = config;
     this.trades = [];
+    this.totalGrossProfit = 0;
+    this.totalCommissionPaid = 0;
     this.realizedPnl = 0;
     this.currentOpenExposure = 0;
     this.maxOpenExposureSeen = 0;
@@ -37,17 +41,33 @@ export class PaperExecutionEngine {
     const tradeId = `paper-${opportunity.id}-${Date.parse(openedAt)}`;
     const stake = this.config.stakeSize;
     const expectedProfit = roundTo(stake * (opportunity.netEdgePct / 100), 4);
+    const expectedGrossProfit = roundTo(stake * (opportunity.grossEdgePct / 100), 4);
+    const effectiveCommissionRate = clamp(
+      opportunity.legs[0].commissionRate + opportunity.legs[1].commissionRate,
+      0,
+      1,
+    );
+    const estimatedCommissionPaid = calculateProfitBasedCommission(expectedGrossProfit, effectiveCommissionRate);
     const baseTrade = {
-      id: tradeId,
+      tradeId,
       opportunityId: opportunity.id,
+      detectedAt: opportunity.detectedAt,
+      openedAt,
       eventName: opportunity.eventName,
       marketType: opportunity.marketType,
       selection: opportunity.selection,
       backExchange: opportunity.legs[0].exchange,
       layExchange: opportunity.legs[1].exchange,
+      backOdds: opportunity.legs[0].odds,
+      layOdds: opportunity.legs[1].odds,
       stake,
+      grossEdgePct: opportunity.grossEdgePct,
+      netEdgePct: opportunity.netEdgePct,
+      grossProfit: 0,
       expectedProfit,
-      openedAt,
+      effectiveCommissionRate,
+      commissionModel: "profit_based" as const,
+      estimatedCommissionPaid,
     };
 
     if (!this.config.enabled) {
@@ -55,6 +75,8 @@ export class PaperExecutionEngine {
         ...baseTrade,
         simulatedProfit: 0,
         status: "rejected",
+        fillRatio: 0,
+        actualCommissionPaid: 0,
         rejectionReason: "paper_trading_disabled",
       });
     }
@@ -64,6 +86,8 @@ export class PaperExecutionEngine {
         ...baseTrade,
         simulatedProfit: 0,
         status: "rejected",
+        fillRatio: 0,
+        actualCommissionPaid: 0,
         rejectionReason: "insufficient_virtual_balance",
       });
     }
@@ -73,6 +97,8 @@ export class PaperExecutionEngine {
         ...baseTrade,
         simulatedProfit: 0,
         status: "rejected",
+        fillRatio: 0,
+        actualCommissionPaid: 0,
         rejectionReason: "max_open_exposure_exceeded",
       });
     }
@@ -84,14 +110,20 @@ export class PaperExecutionEngine {
         0.05,
         0.25,
       );
-      const simulatedProfit = roundTo(-stake * lossRatio, 4);
+      const grossProfit = roundTo(-stake * lossRatio, 4);
+      const actualCommissionPaid = calculateProfitBasedCommission(grossProfit, effectiveCommissionRate);
+      const simulatedProfit = grossProfit;
       this.applyExposure(stake);
-      this.realizedPnl = roundTo(this.realizedPnl + simulatedProfit, 4);
+      this.recordAccounting(grossProfit, actualCommissionPaid, simulatedProfit);
       this.releaseExposure(stake);
       return this.recordTrade({
         ...baseTrade,
+        grossProfit,
         simulatedProfit,
         status: "unmatched_risk",
+        fillRatio: 1,
+        actualCommissionPaid,
+        rejectionReason: "lay_leg_unmatched_after_back_fill",
       });
     }
 
@@ -101,22 +133,29 @@ export class PaperExecutionEngine {
       ? randomBetweenFromUnit(deterministicUnitFloat(`${opportunity.id}|${openedAt}|fill-ratio`), 0.35, 0.9)
       : 1;
     const filledStake = roundTo(stake * fillRatio, 4);
-    // netEdgePct is already net of commissions from the arbitrage engine.
+    const grossProfit = roundTo(filledStake * (opportunity.grossEdgePct / 100), 4);
+    const actualCommissionPaid = calculateProfitBasedCommission(grossProfit, effectiveCommissionRate);
     const simulatedProfit = roundTo(expectedProfit * fillRatio, 4);
 
     this.applyExposure(filledStake);
-    this.realizedPnl = roundTo(this.realizedPnl + simulatedProfit, 4);
+    this.recordAccounting(grossProfit, actualCommissionPaid, simulatedProfit);
     this.releaseExposure(filledStake);
 
     return this.recordTrade({
       ...baseTrade,
+      grossProfit,
       simulatedProfit,
       status: isPartial ? "partial_fill" : "opened",
+      fillRatio: roundTo(fillRatio, 4),
+      actualCommissionPaid,
     });
   }
 
   public getStats(): PaperExecutionStats {
     const endingBalance = this.getEndingBalance();
+    const executedTrades = this.trades.filter((trade) => trade.status !== "rejected");
+    const realizedPaperPnl = this.getRealizedPnl();
+    this.assertAccountingInvariant(realizedPaperPnl);
     this.assertBalanceInvariant(endingBalance);
     return {
       paperTradesOpened: this.openedCount,
@@ -125,17 +164,29 @@ export class PaperExecutionEngine {
       unmatchedRiskEvents: this.unmatchedRiskCount,
       startingBalance: this.config.startingBalance,
       endingBalance,
-      realizedPaperPnl: this.realizedPnl,
+      totalGrossProfit: roundTo(this.totalGrossProfit, 4),
+      totalCommissionPaid: roundTo(this.totalCommissionPaid, 4),
+      realizedPaperPnl,
       maxOpenExposure: roundTo(this.maxOpenExposureSeen, 4),
       currentOpenExposure: roundTo(this.currentOpenExposure, 4),
+      avgProfitPerTrade: this.openedCount > 0 ? roundTo(realizedPaperPnl / this.openedCount, 4) : 0,
+      bestTrade: selectTradeByProfit(executedTrades, "best"),
+      worstTrade: selectTradeByProfit(executedTrades, "worst"),
+      partialFillRate: this.openedCount > 0 ? roundTo(this.partialFillCount / this.openedCount, 4) : 0,
+      unmatchedRiskRate: this.openedCount > 0 ? roundTo(this.unmatchedRiskCount / this.openedCount, 4) : 0,
     };
   }
 
   public assertInvariant(): void {
+    this.assertAccountingInvariant(this.getRealizedPnl());
     this.assertBalanceInvariant(this.getEndingBalance());
   }
 
   private recordTrade(trade: PaperTrade): PaperTrade {
+    if (trade.status === "opened" && Math.abs(trade.simulatedProfit - trade.expectedProfit) >= 0.0001) {
+      throw new Error("PaperExecutionEngine invariant failed: opened simulatedProfit !== expectedProfit");
+    }
+
     this.trades.push(trade);
     if (trade.status === "rejected") {
       this.rejectedCount += 1;
@@ -162,16 +213,50 @@ export class PaperExecutionEngine {
     this.currentOpenExposure = roundTo(Math.max(0, this.currentOpenExposure - exposure), 4);
   }
 
+  private recordAccounting(grossProfit: number, actualCommissionPaid: number, simulatedProfit: number): void {
+    this.totalGrossProfit = roundTo(this.totalGrossProfit + grossProfit, 4);
+    this.totalCommissionPaid = roundTo(this.totalCommissionPaid + actualCommissionPaid, 4);
+    this.realizedPnl = roundTo(this.realizedPnl + simulatedProfit, 4);
+  }
+
   private getEndingBalance(): number {
-    return roundTo(this.config.startingBalance + this.realizedPnl, 4);
+    return roundTo(this.config.startingBalance + this.getRealizedPnl(), 4);
+  }
+
+  private getRealizedPnl(): number {
+    return roundTo(this.realizedPnl, 4);
   }
 
   private assertBalanceInvariant(endingBalance: number): void {
-    const expectedEnding = roundTo(this.config.startingBalance + this.realizedPnl, 4);
+    const expectedEnding = roundTo(this.config.startingBalance + this.getRealizedPnl(), 4);
     if (Math.abs(endingBalance - expectedEnding) > 0.0001) {
       throw new Error("PaperExecutionEngine invariant failed: endingBalance !== startingBalance + realizedPaperPnl");
     }
   }
+
+  private assertAccountingInvariant(realizedPaperPnl: number): void {
+    const expectedPnl = roundTo(
+      this.trades.reduce((sum, trade) => sum + (trade.status === "rejected" ? 0 : trade.simulatedProfit), 0),
+      4,
+    );
+    if (Math.abs(realizedPaperPnl - expectedPnl) > 0.0001) {
+      throw new Error("PaperExecutionEngine invariant failed: realizedPaperPnl !== sum(simulatedProfit)");
+    }
+  }
+}
+
+function selectTradeByProfit(trades: PaperTrade[], direction: "best" | "worst"): PaperTrade | null {
+  const selected = trades.reduce<PaperTrade | null>((current, trade) => {
+    if (!current) {
+      return trade;
+    }
+    if (direction === "best") {
+      return trade.simulatedProfit > current.simulatedProfit ? trade : current;
+    }
+    return trade.simulatedProfit < current.simulatedProfit ? trade : current;
+  }, null);
+
+  return selected ? { ...selected } : null;
 }
 
 function deterministicUnitFloat(key: string): number {
@@ -189,6 +274,14 @@ function hash32(text: string): number {
 
 function randomBetweenFromUnit(unit: number, min: number, max: number): number {
   return min + (max - min) * unit;
+}
+
+function calculateProfitBasedCommission(grossProfit: number, effectiveCommissionRate: number): number {
+  return roundTo(Math.max(grossProfit, 0) * effectiveCommissionRate, 4);
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
 
 function roundTo(value: number, decimals: number): number {
